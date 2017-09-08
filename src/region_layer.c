@@ -213,23 +213,42 @@ void forward_region_layer(const layer l, network net)
             }
             if(onlyclass) continue;
         }
+        // 下面的 for 循环是计算没有物体的 box 的 confidence 的 loss
+        // 1， 遍历所有格子以及每个格子的 box，计算每个 box 与真实 box 的 best_iou
+        // 2， 先不管三七二十一，把该 box 当成没有目标来算 confidence 的 loss
+        // 3， 如果当前 box 的 best_iou > 阈值，则说明该 box 是有物体的，于是上面哪行计算的 loss 就不算数，因此把刚才计算的 confidence 的 loss 清零。
+        // 假设图片被分成了 13 * 13 个格子，那 l.h 和 l.w 就为 13
+        // 于是要遍历所有的格子，因此下面就要循环 13 * 13 次
         for (j = 0; j < l.h; ++j) {
             for (i = 0; i < l.w; ++i) {
+                // 每个格子会预测 5 个 boxes，因此这里要循环 5 次
                 for (n = 0; n < l.n; ++n) {
+                    // 获得 box 在13*13个格子中的 index
                     int box_index = entry_index(l, b, n*l.w*l.h + j*l.w + i, 0);
+                    // 获得第 index 个 box 的预测 x, y, w, h，注意都是相对值，不是真实坐标
+                    //    l.biases 是对应的anchor box的对应的五对宽高值
+                    //    每个格子的坐标可以看做cell距离图像左上角的边距为 (cx,cy)
+                    //    l.output 可以看做每个输出的x,y,w,h的相对值tx,ty,tw,th
                     box pred = get_region_box(l.output, l.biases, n, box_index, i, j, l.w, l.h, l.w*l.h);
                     float best_iou = 0;
+                    // 下面的循环 30 次我是这么理解的：
+                    //        假设一张图片中最多包含 30 个物体，于是对每一个物体求 iou
+                    // PS：我看了很久都没找到这个 30 能和什么关联上，于是猜测 30 的含义是“假设一张图片中最多包含 30 个物体”
                     for(t = 0; t < 30; ++t){
                         box truth = float_to_box(net.truth + t*5 + b*l.truths, 1);
+                        // 遍历完图片中的所有物体后退出
                         if(!truth.x) break;
                         float iou = box_iou(pred, truth);
                         if (iou > best_iou) {
                             best_iou = iou;
                         }
                     }
+                    // 获得预测结果中保存 confidence 的 index
                     int obj_index = entry_index(l, b, n*l.w*l.h + j*l.w + i, 4);
                     avg_anyobj += l.output[obj_index];
+                    // 这里先不管三七二十一，直接把该 box 当成没有目标来算 loss 了
                     l.delta[obj_index] = l.noobject_scale * (0 - l.output[obj_index]);
+                    // 然后再做个判断，如果当期 box 计算的 best_iou > 阈值的话，则说明该 box 是有物体的，于是上面哪行计算的 loss 就不算数，因此清零
                     if (best_iou > l.thresh) {
                         l.delta[obj_index] = 0;
                     }
@@ -240,14 +259,18 @@ void forward_region_layer(const layer l, network net)
                         truth.y = (j + .5)/l.h;
                         truth.w = l.biases[2*n]/l.w;
                         truth.h = l.biases[2*n+1]/l.h;
+                        // 将预测的 tx, ty, tw, th 和 实际box计算得出的 tx',ty', tw', th' 的差存入 l.delta
                         delta_region_box(truth, l.output, l.biases, n, box_index, i, j, l.w, l.h, l.delta, .01, l.w*l.h);
                     }
                 }
             }
         }
+        // 下面的循环 30 次中的 30 这个数我看了很久都没找到这个 30 能和什么关联上，于是猜测 30 的含义是：“假设一张图片中最多包含 30 个物体”
+        // 因此下面是“直接遍历一张图片中的所有已标记的物体的中心所在的格子，然后计算 loss”，而不是“遍历那 13*13 个格子后判断当期格子有无物体，然后计算 loss”
         for(t = 0; t < 30; ++t){
             box truth = float_to_box(net.truth + t*5 + b*l.truths, 1);
 
+            // 如果本格子中不包含任何物体的中心，则跳过
             if(!truth.x) break;
             float best_iou = 0;
             int best_n = 0;
@@ -255,17 +278,26 @@ void forward_region_layer(const layer l, network net)
             j = (truth.y * l.h);
             //printf("%d %f %d %f\n", i, truth.x*l.w, j, truth.y*l.h);
             box truth_shift = truth;
+            // 上面获得了 truth box 的 x,y,w,h，这里讲 truth box 的 x,y 偏移到 0,0，记为 truth_shift.x, truth_shift.y，这么做是为了方便计算 iou
             truth_shift.x = 0;
             truth_shift.y = 0;
             //printf("index %d %d\n",i, j);
+            // 每个格子会预测 5 个 boxes，因此这里要循环 5 次
             for(n = 0; n < l.n; ++n){
                 int box_index = entry_index(l, b, n*l.w*l.h + j*l.w + i, 0);
                 box pred = get_region_box(l.output, l.biases, n, box_index, i, j, l.w, l.h, l.w*l.h);
+                // 这里用 anchor box 的值 / l.w 和 l.h 作为预测的 w 和 h
+                // ps: 我打印了下 l.bias_match，它的值是 1，说明是能走到里面的，而之所以这么做的原因我是这么理解的：
+                //    在 yolo v2 的论文中提到：预测 box 的 w,h 是根据 anchors 生成(anchors 是用 k-means 聚类得出的最优结果)，即：
+                //          w = exp(tw) * l.biases[2*n]   / l.w
+                //          h = exp(th) * l.biases[2*n+1] / l.h
+                //    不过为什么把 exp() 部分省去还有些疑惑，希望有知道原因的大佬能帮忙解答下
                 if(l.bias_match){
                     pred.w = l.biases[2*n]/l.w;
                     pred.h = l.biases[2*n+1]/l.h;
                 }
                 //printf("pred: (%f, %f) %f x %f\n", pred.x, pred.y, pred.w, pred.h);
+                // 上面 truth box 的 x,y 移动到了 0,0 ，因此预测 box 的 x,y 也要移动到 0,0，这么做是为了方便计算 iou
                 pred.x = 0;
                 pred.y = 0;
                 float iou = box_iou(pred, truth_shift);
@@ -276,28 +308,39 @@ void forward_region_layer(const layer l, network net)
             }
             //printf("%d %f (%f, %f) %f x %f\n", best_n, best_iou, truth.x, truth.y, truth.w, truth.h);
 
+             // 根据上面的 best_n 找出 box 的 index
             int box_index = entry_index(l, b, best_n*l.w*l.h + j*l.w + i, 0);
+            // 计算 box 和 truth box 的 iou
             float iou = delta_region_box(truth, l.output, l.biases, best_n, box_index, i, j, l.w, l.h, l.delta, l.coord_scale *  (2 - truth.w*truth.h), l.w*l.h);
+            // 如果 iou > .5，recall +1
             if(iou > .5) recall += 1;
             avg_iou += iou;
 
             //l.delta[best_index + 4] = iou - l.output[best_index + 4];
+            // 根据 best_n 找出 confidence 的 index
             int obj_index = entry_index(l, b, best_n*l.w*l.h + j*l.w + i, 4);
             avg_obj += l.output[obj_index];
+            // 因为运行到这里意味着该格子中有物体中心，所以该格子的 confidence 就是 1， 而预测的 confidence 是 l.output[obj_index]，所以根据公式有下式
             l.delta[obj_index] = l.object_scale * (1 - l.output[obj_index]);
+            // 用 iou 代替上面的 1(经调试，l.rescore = 1，因此能走到这里)
             if (l.rescore) {
                 l.delta[obj_index] = l.object_scale * (iou - l.output[obj_index]);
             }
 
+            // 获得真实的 class
             int class = net.truth[t*5 + b*l.truths + 4];
             if (l.map) class = l.map[class];
+            // 获得预测的 class 的 index
             int class_index = entry_index(l, b, best_n*l.w*l.h + j*l.w + i, 5);
+            // 把所有 class 的预测概率与真实 class 的 0/1 的差 * scale，然后存入 l.delta 里相应 class 序号的位置
             delta_region_class(l.output, l.delta, class_index, class, l.classes, l.softmax_tree, l.class_scale, l.w*l.h, &avg_cat);
             ++count;
             ++class_count;
         }
     }
     //printf("\n");
+    // 现在，l.delta 中的每一个位置都存放了 class、confidence、x, y, w, h 的差，于是通过 mag_array 遍历所有位置，计算每个位置的平方的和后开根
+    // 然后利用 pow 函数求平方
     *(l.cost) = pow(mag_array(l.delta, l.outputs * l.batch), 2);
     printf("Region Avg IOU: %f, Class: %f, Obj: %f, No Obj: %f, Avg Recall: %f,  count: %d\n", avg_iou/count, avg_cat/class_count, avg_obj/count, avg_anyobj/(l.w*l.h*l.n*l.batch), recall/count, count);
 }
@@ -329,8 +372,8 @@ void correct_region_boxes(box *boxes, int n, int w, int h, int netw, int neth, i
     }
     for (i = 0; i < n; ++i){
         box b = boxes[i];
-        b.x =  (b.x - (netw - new_w)/2./netw) / ((float)new_w/netw); 
-        b.y =  (b.y - (neth - new_h)/2./neth) / ((float)new_h/neth); 
+        b.x =  (b.x - (netw - new_w)/2./netw) / ((float)new_w/netw);
+        b.y =  (b.y - (neth - new_h)/2./neth) / ((float)new_h/neth);
         b.w *= (float)netw/new_w;
         b.h *= (float)neth/new_h;
         if(!relative){
@@ -406,9 +449,9 @@ void get_region_boxes(layer l, int w, int h, int netw, int neth, float thresh, f
                     probs[index][j] = (prob > thresh) ? prob : 0;
                     if(prob > max) max = prob;
                     // TODO REMOVE
-                    // if (j == 56 ) probs[index][j] = 0; 
+                    // if (j == 56 ) probs[index][j] = 0;
                     /*
-                       if (j != 0) probs[index][j] = 0; 
+                       if (j != 0) probs[index][j] = 0;
                        int blacklist[] = {121, 497, 482, 504, 122, 518,481, 418, 542, 491, 914, 478, 120, 510,500};
                        int bb;
                        for (bb = 0; bb < sizeof(blacklist)/sizeof(int); ++bb){
